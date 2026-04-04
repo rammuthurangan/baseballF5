@@ -1,24 +1,28 @@
 """
 Full game F5 prediction CLI.
 
-Takes both teams' pitchers and lineups, outputs:
-- Win probability for each team
-- Projected F5 score
-- Spread and total
+Takes both teams' pitchers and lineups, outputs all F5 betting markets:
+- Moneyline (2-way and 3-way with tie)
+- Run lines
+- Totals
+- Alternate run lines and totals
+- Winning margins
 
 Usage:
     python -m f5_model.model.game_predict \
-        --away-pitcher "Gerrit Cole" \
-        --away-lineup "Betts,Ohtani,Freeman,..." \
-        --home-pitcher "Corbin Burnes" \
-        --home-lineup "Soto,Judge,Stanton,..." \
-        --date 2026-04-05 \
-        --park NYY
+        --away-pitcher "Hunter Greene" \
+        --away-lineup "Batter1,Batter2,..." \
+        --away-team "CIN" \
+        --home-pitcher "Nathan Eovaldi" \
+        --home-lineup "Batter1,Batter2,..." \
+        --home-team "TEX" \
+        --date 2026-04-04 \
+        --park TEX
 """
 
 import argparse
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from scipy.stats import poisson
@@ -37,137 +41,181 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def compute_win_probability(lambda_away: float, lambda_home: float, max_runs: int = 15) -> Dict:
-    """
-    Compute win probability for each team using Poisson distributions.
-
-    Args:
-        lambda_away: Predicted F5 runs for away team
-        lambda_home: Predicted F5 runs for home team
-        max_runs: Maximum runs to consider in calculation
-
-    Returns:
-        Dictionary with win probabilities and tie probability
-    """
-    # Build probability mass functions
-    away_probs = np.array([poisson.pmf(k, lambda_away) for k in range(max_runs + 1)])
-    home_probs = np.array([poisson.pmf(k, lambda_home) for k in range(max_runs + 1)])
-
-    # P(away wins) = sum over all i,j where i > j of P(away=i) * P(home=j)
-    p_away_wins = 0.0
-    p_home_wins = 0.0
-    p_tie = 0.0
-
-    for i in range(max_runs + 1):
-        for j in range(max_runs + 1):
-            joint_prob = away_probs[i] * home_probs[j]
-            if i > j:
-                p_away_wins += joint_prob
-            elif j > i:
-                p_home_wins += joint_prob
-            else:
-                p_tie += joint_prob
-
-    return {
-        'away_win': p_away_wins,
-        'home_win': p_home_wins,
-        'tie': p_tie
-    }
-
-
-def compute_spread_probabilities(
-    lambda_away: float,
-    lambda_home: float,
-    spreads: List[float] = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
-    max_runs: int = 15
-) -> Dict:
-    """
-    Compute probability of covering various spreads.
-
-    Spread is from away team perspective (negative = away favored).
-
-    Args:
-        lambda_away: Predicted F5 runs for away team
-        lambda_home: Predicted F5 runs for home team
-        spreads: List of spread lines to evaluate
-        max_runs: Maximum runs to consider
-
-    Returns:
-        Dictionary with cover probabilities for each spread
-    """
-    away_probs = np.array([poisson.pmf(k, lambda_away) for k in range(max_runs + 1)])
-    home_probs = np.array([poisson.pmf(k, lambda_home) for k in range(max_runs + 1)])
-
-    results = {}
-
-    for spread in spreads:
-        # Away team covers if: away_runs - home_runs > spread (for positive spread)
-        # or away_runs - home_runs > spread (away needs to win by more than |spread| if negative)
-        p_cover = 0.0
-
-        for i in range(max_runs + 1):
-            for j in range(max_runs + 1):
-                margin = i - j  # away margin
-                if margin > spread:  # away covers
-                    p_cover += away_probs[i] * home_probs[j]
-
-        results[spread] = p_cover
-
-    return results
-
-
-def compute_total_probabilities(
-    lambda_away: float,
-    lambda_home: float,
-    totals: List[float] = [3.5, 4.5, 5.5, 6.5, 7.5],
-    max_runs: int = 15
-) -> Dict:
-    """
-    Compute over/under probabilities for total runs.
-
-    Args:
-        lambda_away: Predicted F5 runs for away team
-        lambda_home: Predicted F5 runs for home team
-        totals: List of total lines to evaluate
-        max_runs: Maximum runs to consider
-
-    Returns:
-        Dictionary with over probabilities for each total
-    """
-    away_probs = np.array([poisson.pmf(k, lambda_away) for k in range(max_runs + 1)])
-    home_probs = np.array([poisson.pmf(k, lambda_home) for k in range(max_runs + 1)])
-
-    results = {}
-
-    for total in totals:
-        p_over = 0.0
-
-        for i in range(max_runs + 1):
-            for j in range(max_runs + 1):
-                if i + j > total:
-                    p_over += away_probs[i] * home_probs[j]
-
-        results[total] = {
-            'over': p_over,
-            'under': 1 - p_over
-        }
-
-    return results
-
-
 def prob_to_american_odds(prob: float) -> str:
     """Convert probability to American odds format."""
-    if prob <= 0:
-        return "N/A"
-    if prob >= 1:
+    if prob <= 0 or prob >= 1:
         return "N/A"
 
     if prob >= 0.5:
         odds = -100 * prob / (1 - prob)
-        return f"{int(odds)}"
+        return f"{int(round(odds))}"
     else:
         odds = 100 * (1 - prob) / prob
-        return f"+{int(odds)}"
+        return f"+{int(round(odds))}"
+
+
+def compute_all_probabilities(lambda_away: float, lambda_home: float, max_runs: int = 15) -> Dict:
+    """
+    Compute all joint probabilities for the game.
+
+    Returns a matrix of P(away=i, home=j) for all i,j.
+    """
+    away_probs = np.array([poisson.pmf(k, lambda_away) for k in range(max_runs + 1)])
+    home_probs = np.array([poisson.pmf(k, lambda_home) for k in range(max_runs + 1)])
+
+    # Joint probability matrix
+    joint = np.outer(away_probs, home_probs)
+
+    return {
+        'away_probs': away_probs,
+        'home_probs': home_probs,
+        'joint': joint,
+        'max_runs': max_runs
+    }
+
+
+def compute_moneyline_3way(probs: Dict) -> Dict:
+    """Compute 3-way moneyline (away win, tie, home win)."""
+    joint = probs['joint']
+    max_runs = probs['max_runs']
+
+    p_away_win = 0.0
+    p_home_win = 0.0
+    p_tie = 0.0
+
+    for i in range(max_runs + 1):
+        for j in range(max_runs + 1):
+            if i > j:
+                p_away_win += joint[i, j]
+            elif j > i:
+                p_home_win += joint[i, j]
+            else:
+                p_tie += joint[i, j]
+
+    return {
+        'away_win': p_away_win,
+        'home_win': p_home_win,
+        'tie': p_tie
+    }
+
+
+def compute_moneyline_2way(ml_3way: Dict) -> Dict:
+    """Compute 2-way moneyline (excluding ties)."""
+    total = ml_3way['away_win'] + ml_3way['home_win']
+    return {
+        'away_win': ml_3way['away_win'] / total,
+        'home_win': ml_3way['home_win'] / total
+    }
+
+
+def compute_run_line(probs: Dict, spread: float) -> Dict:
+    """
+    Compute run line probabilities.
+
+    spread is from the team's perspective:
+    - Team +0.5 means team can lose by 0 and still cover
+    - Team -0.5 means team must win by 1+
+    """
+    joint = probs['joint']
+    max_runs = probs['max_runs']
+
+    # Away team covers +spread if: away - home > -spread, i.e., away - home >= ceil(-spread)
+    # Home team covers +spread if: home - away > -spread
+
+    p_away_cover = 0.0
+    p_home_cover = 0.0
+
+    for i in range(max_runs + 1):
+        for j in range(max_runs + 1):
+            margin = i - j  # away margin (positive = away winning)
+            # If spread is +0.5 for away, away covers if margin > -0.5, i.e., margin >= 0
+            if margin > -spread:
+                p_away_cover += joint[i, j]
+            # If spread is +0.5 for home, home covers if -margin > -0.5, i.e., margin < 0.5, i.e., margin <= 0
+            if -margin > -spread:
+                p_home_cover += joint[i, j]
+
+    return {
+        'away_cover': p_away_cover,
+        'home_cover': p_home_cover
+    }
+
+
+def compute_total(probs: Dict, line: float) -> Dict:
+    """Compute over/under probabilities for a total line."""
+    joint = probs['joint']
+    max_runs = probs['max_runs']
+
+    p_over = 0.0
+    for i in range(max_runs + 1):
+        for j in range(max_runs + 1):
+            if i + j > line:
+                p_over += joint[i, j]
+
+    return {
+        'over': p_over,
+        'under': 1 - p_over
+    }
+
+
+def compute_winning_margin(probs: Dict) -> Dict:
+    """Compute winning margin probabilities."""
+    joint = probs['joint']
+    max_runs = probs['max_runs']
+
+    results = {
+        'away_by_1': 0.0,
+        'away_by_2': 0.0,
+        'away_by_3_plus': 0.0,
+        'tie': 0.0,
+        'home_by_1': 0.0,
+        'home_by_2': 0.0,
+        'home_by_3_plus': 0.0,
+    }
+
+    for i in range(max_runs + 1):
+        for j in range(max_runs + 1):
+            margin = i - j
+            if margin == 0:
+                results['tie'] += joint[i, j]
+            elif margin == 1:
+                results['away_by_1'] += joint[i, j]
+            elif margin == 2:
+                results['away_by_2'] += joint[i, j]
+            elif margin >= 3:
+                results['away_by_3_plus'] += joint[i, j]
+            elif margin == -1:
+                results['home_by_1'] += joint[i, j]
+            elif margin == -2:
+                results['home_by_2'] += joint[i, j]
+            elif margin <= -3:
+                results['home_by_3_plus'] += joint[i, j]
+
+    # Combined margins
+    results['away_by_1_2'] = results['away_by_1'] + results['away_by_2']
+    results['home_by_1_2'] = results['home_by_1'] + results['home_by_2']
+
+    return results
+
+
+def compute_exact_scores(probs: Dict, top_n: int = 10) -> List[Tuple]:
+    """Get the most likely exact scores."""
+    joint = probs['joint']
+    max_runs = probs['max_runs']
+
+    scores = []
+    for i in range(min(max_runs + 1, 10)):
+        for j in range(min(max_runs + 1, 10)):
+            scores.append((i, j, joint[i, j]))
+
+    scores.sort(key=lambda x: x[2], reverse=True)
+    return scores[:top_n]
+
+
+def format_odds_line(prob: float) -> str:
+    """Format probability with odds."""
+    odds = prob_to_american_odds(prob)
+    return f"{prob:5.1%} ({odds:>5})"
 
 
 def format_game_output(
@@ -177,98 +225,143 @@ def format_game_output(
     home_pitcher: str,
     away_lambda: float,
     home_lambda: float,
-    win_probs: Dict,
-    spread_probs: Dict,
-    total_probs: Dict
+    probs: Dict
 ) -> str:
-    """Format the full game prediction output."""
+    """Format the full game prediction output matching FanDuel markets."""
     lines = []
 
+    # Header
     lines.append("=" * 70)
-    lines.append("F5 GAME PREDICTION")
+    lines.append(f"F5 PREDICTION: {away_team} @ {home_team}")
     lines.append("=" * 70)
-
-    # Matchup
-    lines.append(f"\n{away_team} @ {home_team}")
-    lines.append(f"Away: {away_pitcher}")
-    lines.append(f"Home: {home_pitcher}")
+    lines.append(f"\n  {away_team} Pitcher: {away_pitcher}")
+    lines.append(f"  {home_team} Pitcher: {home_pitcher}")
 
     # Projected Score
     lines.append(f"\n{'=' * 70}")
     lines.append("PROJECTED F5 SCORE")
     lines.append("=" * 70)
-    lines.append(f"\n  {away_team}: {away_lambda:.2f}")
-    lines.append(f"  {home_team}: {home_lambda:.2f}")
-    lines.append(f"\n  Total: {away_lambda + home_lambda:.2f}")
-    lines.append(f"  Spread: {home_team} -{abs(home_lambda - away_lambda):.2f}" if home_lambda < away_lambda
-                 else f"  Spread: {away_team} -{abs(away_lambda - home_lambda):.2f}" if away_lambda < home_lambda
-                 else "  Spread: PICK")
+    lines.append(f"\n  {away_team:>6}  {away_lambda:.2f}")
+    lines.append(f"  {home_team:>6}  {home_lambda:.2f}")
+    lines.append(f"  {'Total':>6}  {away_lambda + home_lambda:.2f}")
 
-    # Win Probability
+    # 3-Way Result
+    ml_3way = compute_moneyline_3way(probs)
     lines.append(f"\n{'=' * 70}")
-    lines.append("F5 WIN PROBABILITY")
+    lines.append("FIRST 5 INNINGS RESULT (3-Way)")
     lines.append("=" * 70)
-    lines.append(f"\n  {away_team}: {win_probs['away_win']:6.1%}  ({prob_to_american_odds(win_probs['away_win'])})")
-    lines.append(f"  {home_team}: {win_probs['home_win']:6.1%}  ({prob_to_american_odds(win_probs['home_win'])})")
-    lines.append(f"  Tie:        {win_probs['tie']:6.1%}  ({prob_to_american_odds(win_probs['tie'])})")
+    lines.append(f"\n  {away_team:<15} {format_odds_line(ml_3way['away_win'])}")
+    lines.append(f"  {'Tie':<15} {format_odds_line(ml_3way['tie'])}")
+    lines.append(f"  {home_team:<15} {format_odds_line(ml_3way['home_win'])}")
 
-    # Moneyline (excluding ties)
-    ml_away = win_probs['away_win'] / (1 - win_probs['tie'])
-    ml_home = win_probs['home_win'] / (1 - win_probs['tie'])
-    lines.append(f"\n  Moneyline (excl. ties):")
-    lines.append(f"    {away_team}: {ml_away:6.1%}  ({prob_to_american_odds(ml_away)})")
-    lines.append(f"    {home_team}: {ml_home:6.1%}  ({prob_to_american_odds(ml_home)})")
-
-    # Spread
+    # 2-Way Moneyline
+    ml_2way = compute_moneyline_2way(ml_3way)
     lines.append(f"\n{'=' * 70}")
-    lines.append("F5 SPREAD (Away Team Perspective)")
+    lines.append("FIRST 5 INNINGS MONEY LINE (2-Way, excl. ties)")
     lines.append("=" * 70)
-    lines.append(f"\n  {'Line':<12} {'Away Cover':>12} {'Home Cover':>12}")
-    lines.append("  " + "-" * 38)
+    lines.append(f"\n  {away_team:<15} {format_odds_line(ml_2way['away_win'])}")
+    lines.append(f"  {home_team:<15} {format_odds_line(ml_2way['home_win'])}")
 
-    for spread in sorted(spread_probs.keys()):
-        p_away_cover = spread_probs[spread]
-        p_home_cover = 1 - p_away_cover
-
-        if spread < 0:
-            label = f"{away_team} {spread}"
-        elif spread > 0:
-            label = f"{away_team} +{spread}"
-        else:
-            label = "PICK"
-
-        lines.append(f"  {label:<12} {p_away_cover:>11.1%} {p_home_cover:>11.1%}")
-
-    # Total
+    # Standard Run Line (+/- 0.5)
+    rl = compute_run_line(probs, 0.5)
     lines.append(f"\n{'=' * 70}")
-    lines.append("F5 TOTAL")
+    lines.append("FIRST 5 INNINGS RUN LINE")
     lines.append("=" * 70)
-    lines.append(f"\n  {'Line':<8} {'Over':>10} {'Under':>10}")
-    lines.append("  " + "-" * 30)
+    lines.append(f"\n  {away_team} +0.5      {format_odds_line(rl['away_cover'])}")
+    lines.append(f"  {home_team} -0.5      {format_odds_line(rl['home_cover'])}")
+    lines.append("")
+    rl_rev = compute_run_line(probs, -0.5)
+    lines.append(f"  {away_team} -0.5      {format_odds_line(rl_rev['away_cover'])}")
+    lines.append(f"  {home_team} +0.5      {format_odds_line(rl_rev['home_cover'])}")
 
-    for total in sorted(total_probs.keys()):
-        p_over = total_probs[total]['over']
-        p_under = total_probs[total]['under']
-        lines.append(f"  {total:<8} {p_over:>9.1%} {p_under:>9.1%}")
+    # Standard Total
+    total_45 = compute_total(probs, 4.5)
+    lines.append(f"\n{'=' * 70}")
+    lines.append("FIRST 5 INNINGS TOTAL RUNS")
+    lines.append("=" * 70)
+    lines.append(f"\n  Over 4.5        {format_odds_line(total_45['over'])}")
+    lines.append(f"  Under 4.5       {format_odds_line(total_45['under'])}")
 
-    # Most likely scores
+    # Alternate Run Lines
+    lines.append(f"\n{'=' * 70}")
+    lines.append("FIRST 5 INNINGS ALTERNATE RUN LINES")
+    lines.append("=" * 70)
+    lines.append(f"\n  {'Line':<18} {'Prob':>7} {'Odds':>8}")
+    lines.append("  " + "-" * 35)
+
+    for spread in [3.5, 2.5, 1.5, 0.5, -0.5, -1.5, -2.5, -3.5]:
+        rl = compute_run_line(probs, spread)
+        sign = "+" if spread >= 0 else ""
+        lines.append(f"  {away_team} {sign}{spread:<12} {rl['away_cover']:>6.1%} {prob_to_american_odds(rl['away_cover']):>8}")
+
+    lines.append("")
+    for spread in [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]:
+        rl = compute_run_line(probs, spread)
+        sign = "+" if spread >= 0 else ""
+        lines.append(f"  {home_team} {sign}{spread:<12} {rl['home_cover']:>6.1%} {prob_to_american_odds(rl['home_cover']):>8}")
+
+    # Alternate Totals
+    lines.append(f"\n{'=' * 70}")
+    lines.append("FIRST 5 INNINGS ALTERNATE TOTAL RUNS")
+    lines.append("=" * 70)
+    lines.append(f"\n  {'Line':<12} {'Over':>8} {'Odds':>8}  |  {'Under':>8} {'Odds':>8}")
+    lines.append("  " + "-" * 55)
+
+    for total_line in [2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]:
+        t = compute_total(probs, total_line)
+        lines.append(f"  {total_line:<12} {t['over']:>7.1%} {prob_to_american_odds(t['over']):>8}  |  {t['under']:>7.1%} {prob_to_american_odds(t['under']):>8}")
+
+    # Winning Margin (5-Way)
+    wm = compute_winning_margin(probs)
+    lines.append(f"\n{'=' * 70}")
+    lines.append("FIRST 5 INNINGS WINNING MARGIN (5-Way)")
+    lines.append("=" * 70)
+    lines.append(f"\n  {away_team} Win By 1-2 Runs     {format_odds_line(wm['away_by_1_2'])}")
+    lines.append(f"  {away_team} Win By 3+ Runs      {format_odds_line(wm['away_by_3_plus'])}")
+    lines.append(f"  Tie                       {format_odds_line(wm['tie'])}")
+    lines.append(f"  {home_team} Win By 1-2 Runs     {format_odds_line(wm['home_by_1_2'])}")
+    lines.append(f"  {home_team} Win By 3+ Runs      {format_odds_line(wm['home_by_3_plus'])}")
+
+    # Winning Margin (Exact)
+    lines.append(f"\n{'=' * 70}")
+    lines.append("FIRST 5 INNINGS WINNING MARGIN (Exact)")
+    lines.append("=" * 70)
+    lines.append(f"\n  {away_team} Win By 1 Run        {format_odds_line(wm['away_by_1'])}")
+    lines.append(f"  {away_team} Win By 2 Runs       {format_odds_line(wm['away_by_2'])}")
+    lines.append(f"  {away_team} Win By 3+ Runs      {format_odds_line(wm['away_by_3_plus'])}")
+    lines.append(f"  Tie                       {format_odds_line(wm['tie'])}")
+    lines.append(f"  {home_team} Win By 1 Run        {format_odds_line(wm['home_by_1'])}")
+    lines.append(f"  {home_team} Win By 2 Runs       {format_odds_line(wm['home_by_2'])}")
+    lines.append(f"  {home_team} Win By 3+ Runs      {format_odds_line(wm['home_by_3_plus'])}")
+
+    # Most Likely Scores
+    exact_scores = compute_exact_scores(probs)
     lines.append(f"\n{'=' * 70}")
     lines.append("MOST LIKELY F5 SCORES")
     lines.append("=" * 70)
+    lines.append(f"\n  {'Score':<15} {'Prob':>7} {'Odds':>8}")
+    lines.append("  " + "-" * 32)
+    for away_score, home_score, prob in exact_scores:
+        score_str = f"{away_team} {away_score} - {home_team} {home_score}"
+        lines.append(f"  {score_str:<15} {prob:>6.1%} {prob_to_american_odds(prob):>8}")
 
-    # Calculate joint probabilities for most likely scores
-    score_probs = []
-    for i in range(8):
-        for j in range(8):
-            p = poisson.pmf(i, away_lambda) * poisson.pmf(j, home_lambda)
-            score_probs.append((i, j, p))
+    # Edge Finder Summary
+    lines.append(f"\n{'=' * 70}")
+    lines.append("SUMMARY")
+    lines.append("=" * 70)
 
-    score_probs.sort(key=lambda x: x[2], reverse=True)
+    # Determine favorite
+    if ml_2way['home_win'] > ml_2way['away_win']:
+        fav_team, fav_prob = home_team, ml_2way['home_win']
+        dog_team, dog_prob = away_team, ml_2way['away_win']
+    else:
+        fav_team, fav_prob = away_team, ml_2way['away_win']
+        dog_team, dog_prob = home_team, ml_2way['home_win']
 
-    lines.append(f"\n  {'Score':<12} {'Probability':>12}")
-    lines.append("  " + "-" * 26)
-    for away_score, home_score, prob in score_probs[:10]:
-        lines.append(f"  {away_score}-{home_score:<10} {prob:>11.1%}")
+    lines.append(f"\n  Favorite: {fav_team} ({prob_to_american_odds(fav_prob)})")
+    lines.append(f"  Underdog: {dog_team} ({prob_to_american_odds(dog_prob)})")
+    lines.append(f"  Projected Total: {away_lambda + home_lambda:.1f}")
+    lines.append(f"  Tie Probability: {ml_3way['tie']:.1%}")
 
     return "\n".join(lines)
 
@@ -461,10 +554,8 @@ def main():
     )
     home_lambda = home_result['predicted_runs']
 
-    # Compute probabilities
-    win_probs = compute_win_probability(away_lambda, home_lambda)
-    spread_probs = compute_spread_probabilities(away_lambda, home_lambda)
-    total_probs = compute_total_probabilities(away_lambda, home_lambda)
+    # Compute all probabilities
+    probs = compute_all_probabilities(away_lambda, home_lambda)
 
     # Format and print output
     output = format_game_output(
@@ -474,9 +565,7 @@ def main():
         home_pitcher=args.home_pitcher,
         away_lambda=away_lambda,
         home_lambda=home_lambda,
-        win_probs=win_probs,
-        spread_probs=spread_probs,
-        total_probs=total_probs
+        probs=probs
     )
 
     print(output)
