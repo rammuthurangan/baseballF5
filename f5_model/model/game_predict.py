@@ -2,11 +2,13 @@
 Full game F5 prediction CLI.
 
 Takes both teams' pitchers and lineups, outputs all F5 betting markets:
+- Projected score and probability distributions
 - Moneyline (2-way and 3-way with tie)
 - Run lines
 - Totals
 - Alternate run lines and totals
 - Winning margins
+- Edge finder (when FanDuel odds provided)
 
 Usage:
     python -m f5_model.model.game_predict \
@@ -18,11 +20,20 @@ Usage:
         --home-team "TEX" \
         --date 2026-04-04 \
         --park TEX
+
+With FanDuel odds comparison:
+    python -m f5_model.model.game_predict \
+        ... \
+        --fd-away-ml 114 \
+        --fd-home-ml -142 \
+        --fd-over-odds -114 \
+        --fd-under-odds -114 \
+        --fd-total 4.5
 """
 
 import argparse
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.stats import poisson
@@ -52,6 +63,14 @@ def prob_to_american_odds(prob: float) -> str:
     else:
         odds = 100 * (1 - prob) / prob
         return f"+{int(round(odds))}"
+
+
+def american_odds_to_prob(odds: int) -> float:
+    """Convert American odds to implied probability."""
+    if odds > 0:
+        return 100 / (odds + 100)
+    else:
+        return abs(odds) / (abs(odds) + 100)
 
 
 def compute_all_probabilities(lambda_away: float, lambda_home: float, max_runs: int = 15) -> Dict:
@@ -119,19 +138,14 @@ def compute_run_line(probs: Dict, spread: float) -> Dict:
     joint = probs['joint']
     max_runs = probs['max_runs']
 
-    # Away team covers +spread if: away - home > -spread, i.e., away - home >= ceil(-spread)
-    # Home team covers +spread if: home - away > -spread
-
     p_away_cover = 0.0
     p_home_cover = 0.0
 
     for i in range(max_runs + 1):
         for j in range(max_runs + 1):
             margin = i - j  # away margin (positive = away winning)
-            # If spread is +0.5 for away, away covers if margin > -0.5, i.e., margin >= 0
             if margin > -spread:
                 p_away_cover += joint[i, j]
-            # If spread is +0.5 for home, home covers if -margin > -0.5, i.e., margin < 0.5, i.e., margin <= 0
             if -margin > -spread:
                 p_home_cover += joint[i, j]
 
@@ -218,6 +232,24 @@ def format_odds_line(prob: float) -> str:
     return f"{prob:5.1%} ({odds:>5})"
 
 
+def calculate_edge(model_prob: float, book_odds: int) -> float:
+    """Calculate edge: model probability - implied probability."""
+    implied = american_odds_to_prob(book_odds)
+    return model_prob - implied
+
+
+def format_edge(edge: float) -> str:
+    """Format edge with color indicator."""
+    if edge > 0.05:
+        return f"+{edge:.1%} **VALUE**"
+    elif edge > 0.02:
+        return f"+{edge:.1%} *"
+    elif edge > 0:
+        return f"+{edge:.1%}"
+    else:
+        return f"{edge:.1%}"
+
+
 def format_game_output(
     away_team: str,
     home_team: str,
@@ -225,7 +257,8 @@ def format_game_output(
     home_pitcher: str,
     away_lambda: float,
     home_lambda: float,
-    probs: Dict
+    probs: Dict,
+    fd_odds: Optional[Dict] = None
 ) -> str:
     """Format the full game prediction output matching FanDuel markets."""
     lines = []
@@ -237,13 +270,109 @@ def format_game_output(
     lines.append(f"\n  {away_team} Pitcher: {away_pitcher}")
     lines.append(f"  {home_team} Pitcher: {home_pitcher}")
 
-    # Projected Score
+    # =========================================================================
+    # PROJECTED SCORE & DISTRIBUTION
+    # =========================================================================
     lines.append(f"\n{'=' * 70}")
     lines.append("PROJECTED F5 SCORE")
     lines.append("=" * 70)
-    lines.append(f"\n  {away_team:>6}  {away_lambda:.2f}")
-    lines.append(f"  {home_team:>6}  {home_lambda:.2f}")
-    lines.append(f"  {'Total':>6}  {away_lambda + home_lambda:.2f}")
+
+    lines.append(f"\n  {away_team:>6}:  {away_lambda:.2f} runs")
+    lines.append(f"  {home_team:>6}:  {home_lambda:.2f} runs")
+    lines.append(f"  {'Total':>6}:  {away_lambda + home_lambda:.2f} runs")
+
+    # Score differential
+    diff = home_lambda - away_lambda
+    if abs(diff) < 0.1:
+        spread_str = "PICK'EM"
+    elif diff > 0:
+        spread_str = f"{home_team} favored by {diff:.2f}"
+    else:
+        spread_str = f"{away_team} favored by {-diff:.2f}"
+    lines.append(f"  {'Spread':>6}:  {spread_str}")
+
+    # Probability Distribution
+    lines.append(f"\n  {away_team} Run Distribution:")
+    lines.append("  " + "-" * 40)
+    for runs in range(7):
+        prob = probs['away_probs'][runs]
+        bar = "#" * int(prob * 50)
+        lines.append(f"    {runs} runs: {prob:5.1%} {bar}")
+    lines.append(f"    7+:    {1 - sum(probs['away_probs'][:7]):5.1%}")
+
+    lines.append(f"\n  {home_team} Run Distribution:")
+    lines.append("  " + "-" * 40)
+    for runs in range(7):
+        prob = probs['home_probs'][runs]
+        bar = "#" * int(prob * 50)
+        lines.append(f"    {runs} runs: {prob:5.1%} {bar}")
+    lines.append(f"    7+:    {1 - sum(probs['home_probs'][:7]):5.1%}")
+
+    # =========================================================================
+    # EDGE FINDER (if FanDuel odds provided)
+    # =========================================================================
+    if fd_odds:
+        ml_3way = compute_moneyline_3way(probs)
+        ml_2way = compute_moneyline_2way(ml_3way)
+
+        lines.append(f"\n{'=' * 70}")
+        lines.append("EDGE FINDER - Model vs FanDuel")
+        lines.append("=" * 70)
+        lines.append(f"\n  {'Market':<25} {'Model':>8} {'FanDuel':>10} {'Edge':>15}")
+        lines.append("  " + "-" * 60)
+
+        # Moneyline edges
+        if fd_odds.get('away_ml') is not None:
+            edge = calculate_edge(ml_2way['away_win'], fd_odds['away_ml'])
+            lines.append(f"  {away_team + ' ML':<25} {prob_to_american_odds(ml_2way['away_win']):>8} {fd_odds['away_ml']:>+10} {format_edge(edge):>15}")
+
+        if fd_odds.get('home_ml') is not None:
+            edge = calculate_edge(ml_2way['home_win'], fd_odds['home_ml'])
+            lines.append(f"  {home_team + ' ML':<25} {prob_to_american_odds(ml_2way['home_win']):>8} {fd_odds['home_ml']:>+10} {format_edge(edge):>15}")
+
+        # 3-way edges
+        if fd_odds.get('away_3way') is not None:
+            edge = calculate_edge(ml_3way['away_win'], fd_odds['away_3way'])
+            lines.append(f"  {away_team + ' (3-way)':<25} {prob_to_american_odds(ml_3way['away_win']):>8} {fd_odds['away_3way']:>+10} {format_edge(edge):>15}")
+
+        if fd_odds.get('tie_3way') is not None:
+            edge = calculate_edge(ml_3way['tie'], fd_odds['tie_3way'])
+            lines.append(f"  {'Tie (3-way)':<25} {prob_to_american_odds(ml_3way['tie']):>8} {fd_odds['tie_3way']:>+10} {format_edge(edge):>15}")
+
+        if fd_odds.get('home_3way') is not None:
+            edge = calculate_edge(ml_3way['home_win'], fd_odds['home_3way'])
+            lines.append(f"  {home_team + ' (3-way)':<25} {prob_to_american_odds(ml_3way['home_win']):>8} {fd_odds['home_3way']:>+10} {format_edge(edge):>15}")
+
+        # Total edges
+        if fd_odds.get('total') is not None:
+            total_probs = compute_total(probs, fd_odds['total'])
+
+            if fd_odds.get('over_odds') is not None:
+                edge = calculate_edge(total_probs['over'], fd_odds['over_odds'])
+                lines.append(f"  {'Over ' + str(fd_odds['total']):<25} {prob_to_american_odds(total_probs['over']):>8} {fd_odds['over_odds']:>+10} {format_edge(edge):>15}")
+
+            if fd_odds.get('under_odds') is not None:
+                edge = calculate_edge(total_probs['under'], fd_odds['under_odds'])
+                lines.append(f"  {'Under ' + str(fd_odds['total']):<25} {prob_to_american_odds(total_probs['under']):>8} {fd_odds['under_odds']:>+10} {format_edge(edge):>15}")
+
+        # Run line edges
+        if fd_odds.get('away_rl_odds') is not None:
+            rl_spread = fd_odds.get('away_rl_spread', 0.5)
+            rl = compute_run_line(probs, rl_spread)
+            edge = calculate_edge(rl['away_cover'], fd_odds['away_rl_odds'])
+            lines.append(f"  {away_team + ' +' + str(rl_spread):<25} {prob_to_american_odds(rl['away_cover']):>8} {fd_odds['away_rl_odds']:>+10} {format_edge(edge):>15}")
+
+        if fd_odds.get('home_rl_odds') is not None:
+            rl_spread = fd_odds.get('home_rl_spread', -0.5)
+            rl = compute_run_line(probs, -rl_spread)
+            edge = calculate_edge(rl['home_cover'], fd_odds['home_rl_odds'])
+            lines.append(f"  {home_team + ' ' + str(rl_spread):<25} {prob_to_american_odds(rl['home_cover']):>8} {fd_odds['home_rl_odds']:>+10} {format_edge(edge):>15}")
+
+        lines.append("\n  Legend: ** VALUE ** = 5%+ edge, * = 2-5% edge")
+
+    # =========================================================================
+    # BETTING MARKETS - MODEL FAIR VALUE
+    # =========================================================================
 
     # 3-Way Result
     ml_3way = compute_moneyline_3way(probs)
@@ -257,20 +386,20 @@ def format_game_output(
     # 2-Way Moneyline
     ml_2way = compute_moneyline_2way(ml_3way)
     lines.append(f"\n{'=' * 70}")
-    lines.append("FIRST 5 INNINGS MONEY LINE (2-Way, excl. ties)")
+    lines.append("FIRST 5 INNINGS MONEY LINE (2-Way)")
     lines.append("=" * 70)
     lines.append(f"\n  {away_team:<15} {format_odds_line(ml_2way['away_win'])}")
     lines.append(f"  {home_team:<15} {format_odds_line(ml_2way['home_win'])}")
 
     # Standard Run Line (+/- 0.5)
     rl = compute_run_line(probs, 0.5)
+    rl_rev = compute_run_line(probs, -0.5)
     lines.append(f"\n{'=' * 70}")
     lines.append("FIRST 5 INNINGS RUN LINE")
     lines.append("=" * 70)
     lines.append(f"\n  {away_team} +0.5      {format_odds_line(rl['away_cover'])}")
     lines.append(f"  {home_team} -0.5      {format_odds_line(rl['home_cover'])}")
     lines.append("")
-    rl_rev = compute_run_line(probs, -0.5)
     lines.append(f"  {away_team} -0.5      {format_odds_line(rl_rev['away_cover'])}")
     lines.append(f"  {home_team} +0.5      {format_odds_line(rl_rev['home_cover'])}")
 
@@ -345,12 +474,11 @@ def format_game_output(
         score_str = f"{away_team} {away_score} - {home_team} {home_score}"
         lines.append(f"  {score_str:<15} {prob:>6.1%} {prob_to_american_odds(prob):>8}")
 
-    # Edge Finder Summary
+    # Summary
     lines.append(f"\n{'=' * 70}")
     lines.append("SUMMARY")
     lines.append("=" * 70)
 
-    # Determine favorite
     if ml_2way['home_win'] > ml_2way['away_win']:
         fav_team, fav_prob = home_team, ml_2way['home_win']
         dog_team, dog_prob = away_team, ml_2way['away_win']
@@ -358,9 +486,10 @@ def format_game_output(
         fav_team, fav_prob = away_team, ml_2way['away_win']
         dog_team, dog_prob = home_team, ml_2way['home_win']
 
-    lines.append(f"\n  Favorite: {fav_team} ({prob_to_american_odds(fav_prob)})")
-    lines.append(f"  Underdog: {dog_team} ({prob_to_american_odds(dog_prob)})")
+    lines.append(f"\n  Projected Score: {away_team} {away_lambda:.1f} - {home_team} {home_lambda:.1f}")
     lines.append(f"  Projected Total: {away_lambda + home_lambda:.1f}")
+    lines.append(f"  Favorite: {fav_team} ({prob_to_american_odds(fav_prob)})")
+    lines.append(f"  Underdog: {dog_team} ({prob_to_american_odds(dog_prob)})")
     lines.append(f"  Tie Probability: {ml_3way['tie']:.1%}")
 
     return "\n".join(lines)
@@ -394,82 +523,58 @@ def main():
     )
 
     # Away team
-    parser.add_argument(
-        "--away-pitcher", "-ap",
-        required=True,
-        help="Away team starting pitcher name"
-    )
-    parser.add_argument(
-        "--away-lineup", "-al",
-        required=True,
-        help="Away team lineup (comma-separated names)"
-    )
-    parser.add_argument(
-        "--away-pitcher-id",
-        type=int,
-        help="Away pitcher MLB ID (skip name lookup)"
-    )
-    parser.add_argument(
-        "--away-lineup-ids",
-        help="Away lineup MLB IDs (comma-separated)"
-    )
-    parser.add_argument(
-        "--away-hand",
-        choices=['L', 'R'],
-        default='R',
-        help="Away pitcher handedness"
-    )
-    parser.add_argument(
-        "--away-team",
-        default="AWAY",
-        help="Away team name for display"
-    )
+    parser.add_argument("--away-pitcher", "-ap", required=True, help="Away team starting pitcher name")
+    parser.add_argument("--away-lineup", "-al", required=True, help="Away team lineup (comma-separated names)")
+    parser.add_argument("--away-pitcher-id", type=int, help="Away pitcher MLB ID (skip name lookup)")
+    parser.add_argument("--away-lineup-ids", help="Away lineup MLB IDs (comma-separated)")
+    parser.add_argument("--away-hand", choices=['L', 'R'], default='R', help="Away pitcher handedness")
+    parser.add_argument("--away-team", default="AWAY", help="Away team name for display")
 
     # Home team
-    parser.add_argument(
-        "--home-pitcher", "-hp",
-        required=True,
-        help="Home team starting pitcher name"
-    )
-    parser.add_argument(
-        "--home-lineup", "-hl",
-        required=True,
-        help="Home team lineup (comma-separated names)"
-    )
-    parser.add_argument(
-        "--home-pitcher-id",
-        type=int,
-        help="Home pitcher MLB ID (skip name lookup)"
-    )
-    parser.add_argument(
-        "--home-lineup-ids",
-        help="Home lineup MLB IDs (comma-separated)"
-    )
-    parser.add_argument(
-        "--home-hand",
-        choices=['L', 'R'],
-        default='R',
-        help="Home pitcher handedness"
-    )
-    parser.add_argument(
-        "--home-team",
-        default="HOME",
-        help="Home team name for display"
-    )
+    parser.add_argument("--home-pitcher", "-hp", required=True, help="Home team starting pitcher name")
+    parser.add_argument("--home-lineup", "-hl", required=True, help="Home team lineup (comma-separated names)")
+    parser.add_argument("--home-pitcher-id", type=int, help="Home pitcher MLB ID (skip name lookup)")
+    parser.add_argument("--home-lineup-ids", help="Home lineup MLB IDs (comma-separated)")
+    parser.add_argument("--home-hand", choices=['L', 'R'], default='R', help="Home pitcher handedness")
+    parser.add_argument("--home-team", default="HOME", help="Home team name for display")
 
     # Game context
-    parser.add_argument(
-        "--date", "-d",
-        required=True,
-        help="Game date (YYYY-MM-DD)"
-    )
-    parser.add_argument(
-        "--park",
-        default="NYY",
-        help="Park code for park factor"
-    )
+    parser.add_argument("--date", "-d", required=True, help="Game date (YYYY-MM-DD)")
+    parser.add_argument("--park", default="NYY", help="Park code for park factor")
+
+    # FanDuel odds for comparison (optional)
+    parser.add_argument("--fd-away-ml", type=int, help="FanDuel away team moneyline odds (e.g., +114)")
+    parser.add_argument("--fd-home-ml", type=int, help="FanDuel home team moneyline odds (e.g., -142)")
+    parser.add_argument("--fd-away-3way", type=int, help="FanDuel away team 3-way odds")
+    parser.add_argument("--fd-home-3way", type=int, help="FanDuel home team 3-way odds")
+    parser.add_argument("--fd-tie-3way", type=int, help="FanDuel tie 3-way odds")
+    parser.add_argument("--fd-total", type=float, help="FanDuel total line (e.g., 4.5)")
+    parser.add_argument("--fd-over-odds", type=int, help="FanDuel over odds (e.g., -114)")
+    parser.add_argument("--fd-under-odds", type=int, help="FanDuel under odds (e.g., -114)")
+    parser.add_argument("--fd-away-rl-spread", type=float, default=0.5, help="FanDuel away run line spread")
+    parser.add_argument("--fd-away-rl-odds", type=int, help="FanDuel away run line odds")
+    parser.add_argument("--fd-home-rl-spread", type=float, default=-0.5, help="FanDuel home run line spread")
+    parser.add_argument("--fd-home-rl-odds", type=int, help="FanDuel home run line odds")
 
     args = parser.parse_args()
+
+    # Build FanDuel odds dict if any provided
+    fd_odds = None
+    if any([args.fd_away_ml, args.fd_home_ml, args.fd_total]):
+        fd_odds = {
+            'away_ml': args.fd_away_ml,
+            'home_ml': args.fd_home_ml,
+            'away_3way': args.fd_away_3way,
+            'home_3way': args.fd_home_3way,
+            'tie_3way': args.fd_tie_3way,
+            'total': args.fd_total,
+            'over_odds': args.fd_over_odds,
+            'under_odds': args.fd_under_odds,
+            'away_rl_spread': args.fd_away_rl_spread,
+            'away_rl_odds': args.fd_away_rl_odds,
+            'home_rl_spread': args.fd_home_rl_spread,
+            'home_rl_odds': args.fd_home_rl_odds,
+        }
 
     # Load model
     print("Loading model...")
@@ -527,7 +632,6 @@ def main():
     print(f"\nPredicting F5 runs...")
 
     # Away team scoring = Home pitcher vs Away lineup
-    # Home pitcher is pitching at home
     away_result = predict_f5_runs(
         model=model,
         feature_names=feature_names,
@@ -541,7 +645,6 @@ def main():
     away_lambda = away_result['predicted_runs']
 
     # Home team scoring = Away pitcher vs Home lineup
-    # Away pitcher is pitching away
     home_result = predict_f5_runs(
         model=model,
         feature_names=feature_names,
@@ -565,7 +668,8 @@ def main():
         home_pitcher=args.home_pitcher,
         away_lambda=away_lambda,
         home_lambda=home_lambda,
-        probs=probs
+        probs=probs,
+        fd_odds=fd_odds
     )
 
     print(output)
