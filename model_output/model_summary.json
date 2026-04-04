@@ -1,0 +1,64 @@
+{
+  "model_type": "XGBoost (count:poisson)",
+  "target": "strikeouts per game",
+  "best_params": {
+    "max_depth": 4,
+    "learning_rate": 0.03,
+    "subsample": 0.9,
+    "colsample_bytree": 0.8,
+    "n_estimators": 600
+  },
+  "n_features": 139,
+  "split_date": "2025-08-20",
+  "results": {
+    "test_mae": 1.837,
+    "test_rmse": 2.3127,
+    "test_r2": 0.1471,
+    "baseline_mae": 1.8501,
+    "baseline_r2": 0.1273,
+    "within_1k": 0.3465,
+    "within_2k": 0.6239
+  },
+  "top_10_features": [
+    {
+      "feature": "szn_strikeouts",
+      "importance": 0.08657236397266388
+    },
+    {
+      "feature": "roll_strikeouts_7g",
+      "importance": 0.03277299925684929
+    },
+    {
+      "feature": "roll_strikeouts_15g",
+      "importance": 0.02274194359779358
+    },
+    {
+      "feature": "szn_whiff_rate",
+      "importance": 0.019056586548686028
+    },
+    {
+      "feature": "szn_k_per_bf",
+      "importance": 0.01868150383234024
+    },
+    {
+      "feature": "szn_avg_effective_speed",
+      "importance": 0.017240140587091446
+    },
+    {
+      "feature": "szn_swstr_rate",
+      "importance": 0.013764913193881512
+    },
+    {
+      "feature": "roll_avg_effective_speed_3g",
+      "importance": 0.011189885437488556
+    },
+    {
+      "feature": "szn_max_velocity",
+      "importance": 0.011095301248133183
+    },
+    {
+      "feature": "szn_total_pitches",
+      "importance": 0.010682575404644012
+    }
+  ]
+}
