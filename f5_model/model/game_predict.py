@@ -131,27 +131,31 @@ def compute_run_line(probs: Dict, spread: float) -> Dict:
     """
     Compute run line probabilities.
 
-    spread is from the team's perspective:
-    - Team +0.5 means team can lose by 0 and still cover
-    - Team -0.5 means team must win by 1+
+    spread is from the AWAY team's perspective in standard sportsbook notation:
+    - spread = +0.5: away +0.5 (away wins or ties), home -0.5 (home wins outright)
+    - spread = -0.5: away -0.5 (away wins outright), home +0.5 (home wins or ties)
+
+    Returns:
+        away_cover: P(away covers the given spread)
+        home_cover: P(home covers the complementary spread) = 1 - away_cover
     """
     joint = probs['joint']
     max_runs = probs['max_runs']
 
     p_away_cover = 0.0
-    p_home_cover = 0.0
 
     for i in range(max_runs + 1):
         for j in range(max_runs + 1):
             margin = i - j  # away margin (positive = away winning)
+            # Away covers +X if margin > -X (e.g., +0.5 covers if margin >= 0)
             if margin > -spread:
                 p_away_cover += joint[i, j]
-            if -margin > -spread:
-                p_home_cover += joint[i, j]
 
+    # Home cover is complementary: if away doesn't cover +X, home covers -X
+    # e.g., if away doesn't cover +0.5 (tie or better), home covers -0.5 (wins outright)
     return {
         'away_cover': p_away_cover,
-        'home_cover': p_home_cover
+        'home_cover': 1 - p_away_cover
     }
 
 
@@ -424,10 +428,13 @@ def format_game_output(
         lines.append(f"  {away_team} {sign}{spread:<12} {rl['away_cover']:>6.1%} {prob_to_american_odds(rl['away_cover']):>8}")
 
     lines.append("")
-    for spread in [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]:
-        rl = compute_run_line(probs, spread)
-        sign = "+" if spread >= 0 else ""
-        lines.append(f"  {home_team} {sign}{spread:<12} {rl['home_cover']:>6.1%} {prob_to_american_odds(rl['home_cover']):>8}")
+    # For home team: iterate home spreads, convert to away spread for computation
+    # Home spread X = Away spread -X (complementary)
+    for home_spread in [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]:
+        away_spread = -home_spread  # Convert: home -0.5 → away +0.5
+        rl = compute_run_line(probs, away_spread)
+        sign = "+" if home_spread >= 0 else ""
+        lines.append(f"  {home_team} {sign}{home_spread:<12} {rl['home_cover']:>6.1%} {prob_to_american_odds(rl['home_cover']):>8}")
 
     # Alternate Totals
     lines.append(f"\n{'=' * 70}")
